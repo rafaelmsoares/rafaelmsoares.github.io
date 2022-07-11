@@ -1,6 +1,6 @@
 ﻿# Studying the KVM MMU with ftrace
 
-The goal here is to get an overview of the KVM memory management internals by analyzing the tracing output of ftrace for the execution of [a minimal KVM example](https://github.com/dpw/kvm-hello-world){:target="_blank"}
+The goal here is to get an overview of the KVM MMU internals by analyzing the tracing output of ftrace for the execution of [a minimal KVM example](https://github.com/dpw/kvm-hello-world){:target="_blank"}
 (`kvm-hello-world`), on an Intel architecture, running Linux 5.18.4. Our analysis focuses on the KVM MMU with support for two dimensional paging (TDP), also known as Second-Level Address Translation (SLAT). On Intel architecture this technology is called Extended Page Tables (EPT):
 
 > The extended page-table mechanism (EPT) is a feature that can be used to support the virtualization of physical
@@ -13,7 +13,7 @@ VMX non-root operation and those used by VM entry for event injection. The trans
 
 In this mode, KVM lets the guest control CR3 and programs the EPT paging structures with the GPA -> HPA mapping. To construct such mapping, KVM uses the set of memory slots (KVM's memslots) that are setup via the `KVM_SET_USER_MEMORY_REGION` ioctl(), which maps GPA to HVA. 
 
-Since Linux 5.10, the KVM x86 MMU brings [some improvements to the TDP direct case](https://lwn.net/Articles/832835/){:target="_blank"}. This new implementation is referred to as the TDP MMU and is the [default](https://lore.kernel.org/all/20210726163106.1433600-1-pbonzini@redhat.com/T/){:target="_blank"} one since Linux 5.15. Up to this moment (Linux 5.18) both implementations coexist and they can be controlled by the module parameter `tdp_mmu`. For more info on the improvements of the TDP MMU, see [this](https://kvmforum2019.sched.com/event/Tn1S/improving-mmu-scalability-in-x86-kvm-ben-gardon-google){:target="_blank"} talk by one of the authors Ben Gardon.
+Since Linux 5.10, the KVM x86 MMU brings [some improvements to the TDP direct case](https://lwn.net/Articles/832835/){:target="_blank"}. This new implementation is referred to as the TDP MMU and is the [default](https://lore.kernel.org/all/20210726163106.1433600-1-pbonzini@redhat.com/T/){:target="_blank"} one since Linux 5.15. Up to this moment (Linux 5.18) both implementations coexist and can be controlled by the module parameter `tdp_mmu`. For more info on the improvements of the TDP MMU, see [this](https://kvmforum2019.sched.com/event/Tn1S/improving-mmu-scalability-in-x86-kvm-ben-gardon-google){:target="_blank"} talk by one of the authors Ben Gardon.
 
 We run `kvm-hello-world` with the `-l` option, which will set up and run the VM in x86 long mode:
 
@@ -21,9 +21,9 @@ We run `kvm-hello-world` with the `-l` option, which will set up and run the VM 
     Testing 64-bit mode
     Hello, world!
     
-We set the ftrace filter to trace the functions belonging to the `kvm` and `kvm_intel` modules and use the `function_graph` tracer. The full ftrace output for the execution of `kvm-hello-world` is [here](./trace-kvm-hello-world-l.txt){:target="_blank"}. It will be the base for our study.
+We set the ftrace filter to trace the functions belonging to the `kvm` and `kvm_intel` modules and use the `function_graph` tracer. The full ftrace output for the execution of `kvm-hello-world` is [here](./trace-kvm-hello-world-l.txt){:target="_blank"}.
     
-The analysis is done is two in two parts: In Section 1 we see how KVM gets the user space memory information through the `KVM_SET_USER_MEMORY_REGION` ioctl() and stores it as KVM's memslots, and in Section 2 we see how the KMV MMU uses the memslots, among other information, to program the EPT paging structures with the GPA -> HPA mapping.
+The analysis is done in two parts: In Section 1 we see how KVM gets the user space memory information through the `KVM_SET_USER_MEMORY_REGION` ioctl() and stores it as KVM's memslots, and in Section 2 we see how the KMV MMU uses the memslots, among other information, to program the EPT paging structures with the GPA -> HPA mapping.
 
 We use the following acronyms to distinguish memory:
  - GVA - guest virtual address
@@ -31,7 +31,7 @@ We use the following acronyms to distinguish memory:
  - HVA - host virtual address
  - HPA - host physical address
 
-## 1. Create memory region
+## 1. Memory region creation
 
 The "physical" address space, as seen from the guest, is passed to KVM via the `KVM_SET_USER_MEMORY_REGION` ioctl(). Below are the parts of the code where this takes place in `kvm-hello-world`:
 
@@ -52,7 +52,7 @@ The "physical" address space, as seen from the guest, is passed to KVM via the `
         ...
     }
 
-The `KVM_SET_USER_MEMORY_REGION` ioctl() takes the struct `kvm_userspace_memory_region` as parameter:
+The `KVM_SET_USER_MEMORY_REGION` ioctl() takes the struct `kvm_userspace_memory_region` as a parameter:
 
     // kvm.h
     struct kvm_userspace_memory_region {
@@ -78,7 +78,9 @@ KVM keeps track of the guest physical memory using what is called **memory slots
           ...
     }
     
-KVM keeps two memory slot sets: one active and one inactive. The current active memslot is pointed by `*memslots`. These are necessary so the VM continues to run on one memslot set while the other is being modified. These two memslot sets normally point to the same set of memslots. They can, however, be desynchronized when performing a memslot management operation by replacing the memslot to be modified by its copy. After the operation is complete, both memslot sets once again point to the same, common set of memslot data [[https://lwn.net/Articles/856392/]](https://lwn.net/Articles/856392/). For more information [see](https://lwn.net/Articles/856392/){:target="_blank"}.
+KVM keeps two memory slot sets: one active and one inactive. The current active memslot is pointed by `*memslots`. These are necessary so the VM continues to run on one memslot set while the other is being modified.
+
+> These two memslot sets should normally point to the same set of memslots. They can, however, be desynchronized when performing a memslot management operation by replacing the memslot to be modified by its copy. After the operation is complete, both memslot sets once again point to the same, common set of memslot data [[https://lwn.net/Articles/856392/]](https://lwn.net/Articles/856392/).
 
 Additionally, the memory slots are stored in two ways: as a [red-black tree](https://patchwork.kernel.org/project/kvm/patch/20211104002531.1176691-27-seanjc@google.com/){:target="_blank"}, and also as an [interval tree](https://patchwork.kernel.org/project/kvm/patch/20211104002531.1176691-25-seanjc@google.com/){:target="_blank"}:
 
@@ -108,9 +110,11 @@ Finally, the memory slot itself looks like this:
         ...
     }
 
+ For more information [see](https://lwn.net/Articles/856392/){:target="_blank"}.
+
 ### Code analysis:
 
-Now let's see what KVM does when we call the `KVM_SET_USER_MEMORY_REGION` ioctl(). The analysis of this part is based on lines 68 to 88 of the ftrace output. The main functions called in this part of the trace are placed below. I also listed some functions that were not available to ftrace (e.g., inline functions).
+Now let's see what KVM does when we call the `KVM_SET_USER_MEMORY_REGION` ioctl(). The analysis of this part is based on lines 68 to 88 of the ftrace output. The main functions called in this part of the trace are placed below. We also listed some functions that were not available to ftrace (e.g., inline functions).
 
     - kvm_vm_ioctl [kvm_main.c]
         - kvm_vm_ioctl_set_memory_region [kvm_main.c]
@@ -132,7 +136,7 @@ Now let's see what KVM does when we call the `KVM_SET_USER_MEMORY_REGION` ioctl(
                         - kvm_commit_memory_region [kvm_main.c]
                             - kvm_arch_commit_memory_region [x86.c]
 
-The first part of the code (until `kvm_set_memslot()`) allocates the new memory slot `new` and populate the struct with the data from the `struct kvm_userspace_memory_region`. Below are some highlights of the `__kvm_set_memory_region()` to get some intuition of what is implemented:
+The first part of the code (until `kvm_set_memslot()`) allocates the new memory slot `new` and populates the struct with the data from the `kvm_userspace_memory_region` struct. Below are some parts of the `__kvm_set_memory_region()` to get an idea of the implementation:
 
     __kvm_set_memory_region [kvm_main.c]
         ...
@@ -151,7 +155,7 @@ The first part of the code (until `kvm_set_memslot()`) allocates the new memory 
         ...
         kvm_set_memslot(kvm, old, new, change); 
 
-In the end, there is a call to `kvm_set_memslot`, which adds the new memory slot to the inactive set and activate. The new memory slot is added to the inactive set (rbtree and the interval tree) using the `kvm_replace_memslot` function:
+In the end, there is a call to `kvm_set_memslot`, which adds the new memory slot to the inactive set and activates it. The new memory slot is added to the inactive set (rbtree and the interval tree) using the `kvm_replace_memslot` function:
 
     kvm_replace_memslot [kvm_main.c]
         ...
@@ -162,7 +166,7 @@ In the end, there is a call to `kvm_set_memslot`, which adds the new memory slot
         ...
         kvm_insert_gfn_node(slots, new)
 
-The insertion in the red-black tree is done by another function called `kvm_insert_gfn_node`:
+The slot is inserted into the red-black tree using another function called `kvm_insert_gfn_node`:
 
     kvm_insert_gfn_node [kvm_main.c]
         ...
@@ -174,13 +178,13 @@ Even though a pointer to `hva_node` and `gfn_node` is inserted, it is possible t
     slot = container_of(node, struct kvm_memory_slot, hva_node[slots->node_idx]);
     slot = container_of(node, struct kvm_memory_slot, gfn_node[idx]);
 
-## 2. Handle EPT violation
+## 2. EPT violation handling
 
-After `kvm-hello-world` issues the first `KVM_RUN` ioctl(), the processor enters VMX non-root operation and starts the execution of the guest code with RIP = 0x0000. In the trace, we see that in the first execution of `KVM_RUN` ioctl() there were 4 VM exits caused by EPT violation and 1 caused by IO (`outb` of char "H') (ftrace output lines 537-1143), then for each execution of the next 13 executions of `KVM_RUN` ioctl() there was at least one VM-exit caused by IO (one exit for each of the 13-length string "ello, world!\n") (ftrace output lines 1146-2465), and the last `KVM_RUN` had a VM-exit caused by the `halt` instruction (ftrace output lines 2466-2552). Since our focus here is on memory virtualization, we only examine the first 4 VM exits, that were caused by EPT violations.
+After `kvm-hello-world` issues the first `KVM_RUN` ioctl(), the processor enters VMX non-root operation and starts the execution of the guest code with RIP = 0x0000. In the trace, we see that in the first execution of `KVM_RUN` ioctl() there were 4 VM exits caused by EPT violation and 1 caused by IO (`outb` of char "H') (ftrace output lines 537-1143), then for each of the next 13 executions of `KVM_RUN` ioctl() there was at least one VM-exit caused by IO (one exit for each of the 13-length string "ello, world!\n") (ftrace output lines 1146-2465), and the last `KVM_RUN` had a VM-exit caused by the `halt` instruction (ftrace output lines 2466-2552). Since our focus here is on memory virtualization, we only examine the first 4 VM exits, caused by an EPT violation.
 
 One of the situations in which an **EPT violation** occurs is when a translation of the guest-physical address encounters an EPT paging-structure entry that is not present. An EPT violation causes a VM exit. In exit qualification phase, KVM determines that it is an EPT page-fault and it will read the page faulting GPA (guest physical address) from the VMCS exit information fields. Given the GPA, KVM finds the corresponding KVM memory slot, which will hold sufficient information to get the HVA needed to fault-in the page and then install the page tables.
 
-Why do we see 4 EPT violations? To answer that let's take a look of how `kvm-hello-world` (in long mode) set up the guest page table:  
+Why do we see 4 EPT violations? To answer that, let's take a look of how `kvm-hello-world` (in long mode) set up the guest page table:  
 
     static void setup_long_mode(struct vm *vm, struct kvm_sregs *sregs)
     {
@@ -201,20 +205,22 @@ Why do we see 4 EPT violations? To answer that let's take a look of how `kvm-hel
         ...
     }
 
-When the guest touches the GVA 0x0000 for the first time, the processor (in VMX non-root) performs paging by traversing a 4-level hierarchy of paging structures whose root structure resides at the physical address in CR3 of the guest. However, when EPT is in use, the addresses in the guest page table are also treated as guest-physical address, and are not used to access memory directly, Instead, those addresses in the guest page tables are also translated using EPT. This is what happens in more detail:
+When the guest touches the GVA 0x0000 for the first time, the processor (in VMX non-root) performs paging by traversing a 4-level hierarchy of paging structures whose root structure resides at the physical address in CR3 of the guest. However, when EPT is in use, the addresses in the guest page table are also treated as guest-physical address, and are not used to access memory directly. Instead, those addresses in the guest page tables are also translated using EPT. This is what happens in more detail:
 
 1. Guest starts with the RIP=0x0000 (GVA) in VMX non-root operation.
 2. Guest needs to translate the GVA and uses CR3 to locate the first paging-structure in the hierarchy (PML4), which is located at the guest-physical address (GPA) 0x2000. Since the EPT cannot translate this GPA, it causes an EPT violation.
-3. KVM set up the EPT page hierarchy to translate GPA 0x2000 -> some HPA.
+3. KVM set up the EPT page hierarchy (PML4E, PDPTE, PDE, and PE) to translate GPA 0x2000 -> some HPA.
 4. EPT is now able to get the HPA of 0x2000 and load its value, which will hold the still unmapped GPA 0x3000 (PDPT).  EPT violation.
-5. KVM set up the EPT page hierarchy to translate GPA 0x3000 -> some HPA.
+5. KVM set up the EPT page hierarchy (PE only) to translate GPA 0x3000 -> some HPA.
 6. EPT is now able to get the HPA of 0x3000 and load its value, which will hold the GPA 0x4000  (PD). EPT violation.
-7. KVM set up the EPT page hierarchy to translate GPA 0x4000 -> some HPA.
+7. KVM set up the EPT page hierarchy (PE only) to translate GPA 0x4000 -> some HPA.
 8. EPT is now able to get the HPA of 0x4000 and load its value, which will hold the GPA 0x0000.  EPT violation.
-9. KVM set up the EPT page hierarchy to translate GPA 0x0000 -> some HPA.
+9. KVM set up the EPT page hierarchy (PE only) to translate GPA 0x0000 -> some HPA.
 10. Guest is now able to fetch the instruction from the current RIP - the MMU hardware in non-root mode can now page walk its entire hierarchy to get the GVA->GPA translation, and EPT can also get the GPA->HPA translation.
 
-Now let's look of how KVM handles an EPT violation. We split our analysis into two parts: Section 2.1 shows how KVM finds the corresponding KVM memory slot of a given guest frame number, which will hold sufficient information to get the HVA needed to fault-in the page, and in Section 2.2 we show how KVM installs the EPT page tables. In the same way as was done in the previous section, the main functions called in this part of the trace are placed below (left brackets indicates which part of the snippet is analyzed in each section):
+It worth noting that only in step (3) the full hierarchy needs to be filled, in steps (5), (7), and (9) the PML4E, PDPTE, and PDE are already present. This is because bits 20:12 of the guest-physical address index the EPT page table, and it is the only range varying between addresses 0x2000, 0x3000, 0x4000, and 0x0000.
+
+Now let's look how KVM handles an EPT violation. We split our analysis into two parts: Section 2.1 shows how KVM finds the corresponding KVM memory slot of a given guest frame number, which will hold sufficient information to get the HVA needed to fault-in the page, and in Section 2.2 we show how KVM installs the EPT page tables. In the same way as was done in the previous section, the main functions called in this part of the trace are placed below (left brackets indicates which part of the snippet is analyzed in each section):
 
            - vmx_handle_exit  [vmx.c]
               - __vmx_handle_exit [vmx.c]
@@ -272,7 +278,7 @@ Then we get the host address from the memory slot:
         
 #### HVA -> PFN
 
-Finally, KVM uses the `get_user_pages*()` family to fault in the guest page. This maps the user memory (registered using the `KVM_SET_USER_MEMORY_REGION`  ioctl()) into kernel space and returns the physical page frame number (PFN) to be installed into the EPT page tables.
+Finally, KVM uses the `get_user_pages*()` family to fault in the guest page  (in the `kvm-hello-world` case, the fast path suffices). This maps the user memory (registered using the `KVM_SET_USER_MEMORY_REGION`  ioctl()) into kernel space and returns the physical page frame number (PFN) to be installed into the EPT page tables.
 
     - hva_to_pfn [kvm_main.c]
         - hva_to_pfn_fast [kvm_main.c]
@@ -280,7 +286,7 @@ Finally, KVM uses the `get_user_pages*()` family to fault in the guest page. Thi
 
 ### 2.2 Code analysis: Creation of page tables and SPTEs
 
-After the page has been faulted in, now we look at how KVM programs EPT page tables to create a relation between guest physical address to host physical address (GPA -> HPA). If you are familiar with paging on Intel x86-64 you will find it very similar. As stated before, when EPT is active the addresses used and produced by the guest are not used as physical addresses to reference in memory. Instead, the processor interprets them as guest physical addresses and translates them to physical addresses. The translation mechanism works by traversing a 4-level hierarchy of paging structures (PML4Es, then PDPTEs, then PDEs, and finally, PEs) whose root structure resides at the physical address in the EPT pointer (EPTP) in the VMCS. Each paging structure is 4-KBytes in size and comprises 512 64-bit entries.
+After the page has been faulted in, we now look at how KVM programs EPT page tables to create a relation between guest physical address to host physical address (GPA -> HPA). If you are familiar with paging on Intel x86-64 you will find it very similar. As stated before, when EPT is active the addresses used and produced by the guest are not used as physical addresses to reference in memory. Instead, the processor interprets them as guest physical addresses and translates them to physical addresses. The translation mechanism works by traversing a 4-level hierarchy of paging structures (PML4Es, then PDPTEs, then PDEs, and finally, PEs) whose root structure resides at the physical address in the EPT pointer (EPTP) in the VMCS. Each paging structure is 4-KBytes in size and comprises 512 64-bit entries.
 
 KVM abstracts each EPT page table with a generic concept called SPT (Shadow Page Table). Each entry in the SPT is called SPTE (Shadow Page Table Entry). Why this name? My intuition is that since the SPTE format is [common to both the shadow MMU and the TDP MMU](https://patchwork.kernel.org/project/kvm/patch/20201023163024.2765558-5-pbonzini@redhat.com/){:target="_blank"} (e.g., AMD's NPT and Intel's EPT), it's a generic and vendor-neutral term. In summary, in KVM terminology, the page structure of the EPT is a SPT, and each entry in the page structure is the SPTE.
 
@@ -299,13 +305,13 @@ The pointer to each SPT is stored in the data structure `struct kvm_mmu_page`, w
         ...
     }
 
-The core member is the `spt`, which points to the base address of a physical page and stores 512 page table entries (SPTEs). As shown above, this structure also stores other information besides `spt`, that are not directly used by the EPT mechanism, but that are import to the KVM, such as the role of page structure in the EPT page hierarchy.
+The core member is the `spt`, which points to the base address of a physical page and stores 512 page table entries (SPTEs). As shown above, this structure also stores other information besides `spt`, that are not directly used by the EPT mechanism, but that are important to the KVM, such as the role of a page structure in the EPT page hierarchy.
 
 The diagram below gives an overview of the main data structures examined in this section. The blue part corresponds to what Intel's EPT hardware mechanism sees.
 
 ![](./ept_data_struct.svg)
 
-All the mapping we discussed above is handled by function `kvm_tdp_mmu_map` (`tdp_mmu.c`). The function header comment of this function states: "Handle a TDP page fault (NPT/EPT violation/misconfiguration) by installing page tables and SPTEs to translate the faulting guest physical address". The function iterates the EPT paging struct and from each level it: allocates memory for the shadow page and the SPT, initializes them and links the parent level SPTE to point to the current level SPTE:
+All the mapping we discussed above is handled by function `kvm_tdp_mmu_map` (`tdp_mmu.c`). The function header comment of this function states: "Handle a TDP page fault (NPT/EPT violation/misconfiguration) by installing page tables and SPTEs to translate the faulting guest physical address". The function iterates the EPT paging struct and from each level it allocates memory for the shadow page and the SPT, initializes them and links the parent level SPTE to point to the current level SPTE:
 
     - kvm_tdp_mmu_map [tdp_mmu.c]
      - tdp_mmu_for_each_pte
@@ -314,7 +320,7 @@ All the mapping we discussed above is handled by function `kvm_tdp_mmu_map` (`td
        - tdp_mmu_link_sp
      - tdp_mmu_map_handle_target_level
 
-We now examine the code each of these 3 steps separately:
+We now examine the code of each of these 3 steps separately:
 
 #### Shadow page and SPTEs allocation (`tdp_mmu_alloc_sp`)
 
@@ -324,7 +330,7 @@ We now examine the code each of these 3 steps separately:
         - sp = kvm_mmu_memory_cache_alloc(&vcpu->arch.mmu_page_header_cache)
         - sp->spt = kvm_mmu_memory_cache_alloc(&vcpu->arch.mmu_shadow_page_cache)
 
-The difference between these two allocations1 is as follows:
+The difference between these two allocations is as follows:
 - `mmu_page_header_cache`: it allocates the shadow page of size `sizeof(struct kvm_mmu_page)` and uses a slab allocator for it
 - `mmu_shadow_page_cache`: it allocates a page table holding the 512 page table entries (SPTEs) and uses a page allocator
 
@@ -355,7 +361,7 @@ Both `mmu_page_header_cache` and `mmu_shadow_page_cache` are of type struct `kvm
         
 ##### Extra: Creation of the shadow page cache
 
-The `mmu_page_header_cache` cache is created in the module initialization, which is not shown in the ftrace output I posted in here:
+The `mmu_page_header_cache` cache is created in the module initialization, which is not shown in the ftrace output we posted in here:
 
     - vmx_init [vmx.c] // module_init(vmx_init)
         - kvm_init [kvm_main.c]
@@ -372,7 +378,7 @@ and it is set to the VMM in:
 
 #### Shadow page initialization (`tdp_mmu_init_child_sp`)
 
-Fill in the shadow page fields such as the role - the level of the page structure in the EPT page hierarchy:
+Fill in the shadow page fields, such as the role - the level of the page structure in the EPT page hierarchy:
 
     - tdp_mmu_init_child_sp [tdp_mmu.c]
         - parent_sp = sptep_to_sp(rcu_dereference(iter->sptep));
@@ -411,7 +417,7 @@ Using Intel's EPT, the `make_nonleaf_spte()` function will return an entry in th
             return spte;
     }
 
-`kvm_mmu_set_ept_masks` gets called in the module initialization, which is not shown in the ftrace output I posted in here. The execution path looks something like this:
+`kvm_mmu_set_ept_masks` gets called in the module initialization, which is not shown in the ftrace output we posted in here. The execution path looks something like this:
 
     - vmx_init [vmx.c] // module_init(vmx_init)
         - kvm_init [kvm_main.c]
@@ -421,7 +427,7 @@ Using Intel's EPT, the `make_nonleaf_spte()` function will return an entry in th
 
 #### The leaf SPTE mapping (`tdp_mmu_map_handle_target_level`)
 
-Above we describe the process of filling non-leaf page table entries. The leaf SPTE (leaf page table entry, the one finally holding an entry pointing to a physical page) is set up in `tdp_mmu_map_handle_target_level()`:
+Above we described the process of filling non-leaf page table entries. The leaf SPTE (leaf page table entry, the one finally holding an entry pointing to a physical page) is set up in `tdp_mmu_map_handle_target_level()`:
 
     - tdp_mmu_map_handle_target_level
       - u64 new_spte
@@ -434,7 +440,7 @@ Function `make_spte()` works in a similar way to the `make_nonleaf_spte()`: it w
 
 #### What about the root page table?
 
-The root page (the PML4 table on Intel's EPT) gets created and initialized in `kvm_mmu_load()` function, which will also set the EPT pointer to it. It will also use the `tdp_mmu_alloc_sp()` and `tdp_mmu_init_sp()` that we discussed above. The execution path looks something like this:
+The root page (the PML4 table on Intel's EPT) gets created and initialized in `kvm_mmu_load()` function, which will also set the EPT pointer to it. It also uses the `tdp_mmu_alloc_sp()` and `tdp_mmu_init_sp()` that we discussed above. The execution path looks something like this:
 
     - kvm_mmu_load [mmu.c]
         - mmu_alloc_direct_roots [mmu.c]
@@ -451,7 +457,7 @@ The root page (the PML4 table on Intel's EPT) gets created and initialized in `k
 
 #### Summary
 
-Figure below summarizes the main steps examined is this section:
+The figure below summarizes the main steps examined is this section:
 ![](./ept_construction.svg)
 
 //TODO: release the reference to the struct page - kvm_release_pfn_clean
